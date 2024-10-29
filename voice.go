@@ -40,7 +40,8 @@ type VoiceConnection struct {
 	deaf         bool
 	mute         bool
 	speaking     bool
-	reconnecting bool // If true, voice connection is trying to reconnect
+	reconnecting bool     // If true, voice connection is trying to reconnect
+	ssrc         sync.Map // Map of SSRC to VoiceSpeakingUpdate
 
 	OpusSend chan []byte  // Chan for sending opus audio
 	OpusRecv chan *Packet // Chan for receiving opus audio
@@ -220,10 +221,17 @@ func (v *VoiceConnection) AddHandler(h VoiceSpeakingUpdateHandler) {
 	v.voiceSpeakingUpdateHandlers = append(v.voiceSpeakingUpdateHandlers, h)
 }
 
+func (v *VoiceConnection) GetSpeakerBySSRC(ssrc uint32) *VoiceSpeakingUpdate {
+	if val, ok := v.ssrc.Load(ssrc); ok {
+		return val.(*VoiceSpeakingUpdate)
+	}
+	return nil
+}
+
 // VoiceSpeakingUpdate is a struct for a VoiceSpeakingUpdate event.
 type VoiceSpeakingUpdate struct {
 	UserID   string `json:"user_id"`
-	SSRC     int    `json:"ssrc"`
+	SSRC     uint32 `json:"ssrc"`
 	Speaking bool   `json:"speaking"`
 }
 
@@ -484,15 +492,14 @@ func (v *VoiceConnection) onEvent(message []byte) {
 		return
 
 	case 5:
-		if len(v.voiceSpeakingUpdateHandlers) == 0 {
-			return
-		}
-
 		voiceSpeakingUpdate := &VoiceSpeakingUpdate{}
 		if err := json.Unmarshal(e.RawData, voiceSpeakingUpdate); err != nil {
 			v.log(LogError, "OP5 unmarshall error, %s, %s", err, string(e.RawData))
 			return
 		}
+
+		// add the ssrc to the map
+		v.ssrc.Store(voiceSpeakingUpdate.SSRC, voiceSpeakingUpdate)
 
 		for _, h := range v.voiceSpeakingUpdateHandlers {
 			h(v, voiceSpeakingUpdate)
@@ -803,6 +810,9 @@ type Packet struct {
 	Type      []byte
 	Opus      []byte
 	PCM       []int16
+
+	// UserID is the user ID associated with this packet's SSRC
+	UserID string
 }
 
 // opusReceiver listens on the UDP socket for incoming packets
@@ -872,6 +882,11 @@ func (v *VoiceConnection) opusReceiver(udpConn *net.UDPConn, close <-chan struct
 			if len(p.Opus) > shift {
 				p.Opus = p.Opus[shift:]
 			}
+		}
+
+		// get the user ID associated with this packet's SSRC
+		if speaker := v.GetSpeakerBySSRC(p.SSRC); speaker != nil {
+			p.UserID = speaker.UserID
 		}
 
 		if c != nil {
